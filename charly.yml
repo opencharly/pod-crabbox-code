@@ -1,0 +1,42 @@
+# pod-crabbox-code — the code-server lease image for the Crabbox containerd
+# provider.
+#
+# One repo per image (W5.2). The image imports the base lease image at a PINNED
+# tag, so the image tag and the git tag name the same build:
+# ghcr.io/opencharly/pod-crabbox-code:<tag> is the tree tagged <tag>.
+repo: github.com/opencharly/pod-crabbox-code
+defaults:
+    platform:
+        - linux/amd64
+    tag: auto
+    registry: ghcr.io/opencharly
+    build:
+        - pac
+import: []
+discover:
+    - path: candy
+      recursive: true
+
+pod-crabbox-code:
+    candy:
+        description: |
+            The code-server lease image for a Crabbox `containerd` lease: the base
+            `pod-crabbox` contract with the pinned `code-server` release installed at
+            `/usr/local/lib/code-server` and a `crabbox-start-code` wrapper that binds
+            it to `127.0.0.1:8080` over the lease's SSH session. The release is a
+            pinned upstream GitHub tarball rather than a rolling distro/AUR package,
+            so the version the image ships is the version in the URL; the wrapper
+            never binds a public interface.
+        base: ghcr.io/opencharly/pod-crabbox:2026.307.1828
+        # An OCI base does not inherit the parent's distro/build values, so the
+        # CachyOS chain is declared here; the base image is itself CachyOS.
+        distro:
+            - cachyos
+            - arch
+        # PID 1 is the base image's `sshd -D`, which must run as root; the LOGIN
+        # user stays `crabbox` (uid 1000), created by the inherited candy.
+        user: root
+        uid: 0
+        gid: 0
+        candy:
+            - code-server
