@@ -42,6 +42,11 @@ Canonical files:
 - `charly box generate pod-crabbox-code` — inspect the emitted Containerfile and the baked
   `ai.opencharly.description` plan.
 - `charly check box pod-crabbox-code` — the build-scope `check:` steps.
+- `charly check run check-pod-crabbox-code-serves` — the disposable R10 bed: boots the
+  image as a pod, drives the `/crabbox` contract, starts `crabbox-start-code` over SSH as
+  `crabbox`, and asserts the installed release ANSWERS over HTTP on its loopback-only
+  8080 (plus SSH as `crabbox`, `sudo -n true`, and the readiness hook exiting 0). A
+  build-scope check cannot prove a running service answers; this bed can.
 - The PR image build (`.github/workflows/image.yml`, `pull_request` path) builds
   the image and publishes nothing; the merge-time `workflow_run` path publishes
   `ghcr.io/opencharly/pod-crabbox-code:<git-tag>`.
