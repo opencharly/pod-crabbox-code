@@ -1,0 +1,80 @@
+# code-server — a pinned upstream code-server release plus a loopback-only wrapper.
+code-server:
+    candy:
+        description: |
+            `code-server` at a pinned upstream version, installed under
+            `/usr/local/lib/code-server` from the release tarball named by
+            `CODE_SERVER_VERSION`. `/usr/local/bin/code-server` is the release's own
+            entry point; `/usr/local/bin/crabbox-start-code` starts it bound to
+            `127.0.0.1:8080` with authentication left to the lease's SSH boundary,
+            which is the only way it is reachable. The build check asserts the
+            pinned version string and the loopback bind, not merely that a file
+            exists.
+        var:
+            # The release TAG carries a `v` prefix; the ASSET filename does not.
+            CODE_SERVER_VERSION: 4.144.0
+        # The lease SSH port is the base image's own contract. An OCI base does not
+        # carry its candy chain's ports across the boundary, so the published number
+        # is restated here (one number, taken from the base image's label).
+        port:
+            - 2222
+
+        plan:
+            - run: install the pinned code-server release
+              download: "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server-${CODE_SERVER_VERSION}-linux-amd64.tar.gz"
+              extract: tar.gz
+              strip_components: 1
+              to: /usr/local/lib/code-server
+              run_as: root
+            - run: expose the release entry point on PATH
+              link: /usr/local/bin/code-server
+              target: /usr/local/lib/code-server/bin/code-server
+              run_as: root
+            - run: write the loopback-only start wrapper
+              write: /usr/local/bin/crabbox-start-code
+              mode: "0755"
+              run_as: root
+              content: |
+                #!/bin/bash
+                # Started over SSH by the lease consumer; never a public bind.
+                set -euo pipefail
+                exec /usr/local/lib/code-server/bin/code-server \
+                    --bind-addr 127.0.0.1:8080 --auth none "$@"
+            - check: the pinned code-server release is installed and executable
+              id: code-server-binary
+              exit_status: 0
+              command: >-
+                  test -x /usr/local/lib/code-server/bin/code-server
+            - check: code-server reports the pinned version
+              id: code-server-version
+              exit_status: 0
+              stdout:
+                  - contains: "4.144.0"
+              command: >-
+                  /usr/local/lib/code-server/bin/code-server --version
+            - check: the start wrapper binds loopback only and is executable
+              id: code-server-wrapper
+              exit_status: 0
+              command: >-
+                  test -x /usr/local/bin/crabbox-start-code &&
+                  grep -q -- '--bind-addr 127.0.0.1:8080' /usr/local/bin/crabbox-start-code
+            # The base is a published OCI artifact, so its contract is probed here at
+            # THIS image's boundary — not re-implemented, and not assumed from the tag.
+            - check: the inherited lease SSH contract is present (sshd, bootstrap, readiness hook)
+              id: code-server-lease-binaries
+              exit_status: 0
+              command: >-
+                  test -x /usr/sbin/sshd &&
+                  test -x /usr/local/libexec/crabbox/bootstrap.sh &&
+                  test -x /usr/local/libexec/crabbox/ready
+            - check: the inherited lease login user is crabbox at uid 1000
+              id: code-server-lease-user
+              exit_status: 0
+              command: >-
+                  test "$(getent passwd 1000 | cut -d: -f1)" = crabbox
+            - check: the inherited SSH drop-in names port 2222 and sshd parses it
+              id: code-server-lease-sshd
+              exit_status: 0
+              command: >-
+                  grep -qx 'Port 2222' /etc/ssh/sshd_config.d/99-crabbox.conf &&
+                  /usr/sbin/sshd -t
