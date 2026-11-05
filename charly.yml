@@ -40,3 +40,279 @@ pod-crabbox-code:
         gid: 0
         candy:
             - code-server
+
+# =============================================================================
+# check-pod-crabbox-code-serves — the disposable R10 bed for the code-server
+# lease image.
+#
+# The image's own `check:` steps are BUILD-scope: they assert the release is
+# installed, reports the pinned version, that the wrapper carries the loopback
+# bind, and that the inherited lease files exist. A build container never starts
+# the editor, so none of them can prove the thing this variant exists for:
+# code-server is present AND SERVES inside a running lease. This bed does,
+# because the deploy boots the image and the bed drives the running system.
+#
+# The venue is a disposable pod built from the image under review; its container
+# and its input volume are torn down with it.
+#
+# This bed deliberately does NOT claim the containerd substrate: in the pinned
+# toolchain a `pod:` deploy's authored `engine:` selector is dropped by the
+# check-bed `config`/`start` path (`charly config` emits a podman quadlet) and
+# `charly deploy add --engine` is an unknown flag (opencharly/charly#1109).
+# What this bed proves is this image's own, engine-independent running contract
+# on a disposable pod — the same scope its three sibling beds claim.
+#
+# Three steps, in the order that makes the bed a gate rather than a snapshot:
+#   1. ABSENCE  — reset the state, assert the instruments exist, then prove the
+#                 editor is NOT serving (nothing listens on its loopback port
+#                 and an HTTP probe gets no answer) while the lease still
+#                 REFUSES the freshly generated key. The instruments are
+#                 asserted first, so their silence is a measurement; a venue
+#                 that does not answer fails the step instead of reading as
+#                 "nothing started yet".
+#   2. PERFORM  — write the read-only lease inputs temp + mv, run the image's
+#                 own shared bootstrap, and start `crabbox-start-code` through
+#                 the lease's OWN SSH path as `crabbox`, detached from the
+#                 channel. Starting it any other way would not prove the
+#                 contract user can run the starter.
+#   3. PRESENCE — the editor ANSWERS over HTTP from the installed release
+#                 (health endpoint and the workbench page), the listener is
+#                 loopback-only, and the process that owns the socket is the
+#                 installed release running as the lease user; the lease
+#                 contract still holds over SSH as `crabbox` on 2222 with
+#                 passwordless sudo and `/usr/local/libexec/crabbox/ready`
+#                 exiting 0.
+#
+# The plan runs at every check-live pass, including the fresh-rebuild pass, so
+# step 1 resets and step 2 re-applies: each pass measures its OWN perform.
+# =============================================================================
+check-pod-crabbox-code-serves:
+    pod:
+        image: pod-crabbox-code
+        disposable: true
+        lifecycle: test
+        description: >-
+            R10 witness for the pod-crabbox-code lease image: a disposable
+            container built from the image runs the base lease's direct-mode
+            entrypoint, and the bed drives the editor in three steps — ABSENCE
+            (code-server is installed but not serving, and the lease refuses the
+            key), PERFORM (the shared bootstrap consumes authorized_keys,
+            lease.env and bootstrap.sh, and the lease user starts
+            `crabbox-start-code` over SSH), and PRESENCE (the installed release
+            answers over HTTP on its loopback-only 8080 — health endpoint and
+            workbench page — with the listening process owned by uid 1000, and
+            the lease holds over SSH as `crabbox` on 2222 with passwordless sudo
+            and `/usr/local/libexec/crabbox/ready` exiting 0). A missing
+            release, a starter that does not serve, a public bind, an
+            unapplied input, a missing listener, login user, sudo grant or
+            readiness hook fails the bed; a venue that is not answering fails
+            the absence step instead of reading as "nothing started yet". The
+            containerd LEASE venue (opencharly/charly#1109) and the
+            Docker-compatible socket (opencharly/pod-crabbox-nested#1) are
+            explicitly not claimed.
+        volume:
+            - name: lease-inputs
+              type: volume
+              path: /crabbox
+        plan:
+            - check: absence — the editor is installed but NOT serving, and the lease refuses the freshly generated key
+              id: code-server-absent-before-start
+              context:
+                - runtime
+              timeout: 180s
+              eventually: 60s
+              retry_interval: 2s
+              command:
+                  command: |
+                      set -euo pipefail
+                      # The instruments must exist before their silence means
+                      # anything: this image is expected to ship the release and
+                      # the starter, and the direct-mode base to keep sshd as PID 1.
+                      test -x /usr/local/lib/code-server/bin/code-server
+                      test -x /usr/local/bin/crabbox-start-code
+                      test "$(ps -p 1 -o comm=)" = sshd
+                      # Reset whatever an earlier pass left behind. Stop the
+                      # listener by the pid the kernel reports for the socket,
+                      # never by a process-name pattern: a `pkill -f` pattern
+                      # also matches this shell's own argv.
+                      pids=$(ss -ltnpH 'sport = :8080' | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)
+                      if [ -n "$pids" ]; then
+                        kill -KILL $pids 2>/dev/null || true
+                      fi
+                      # The plan runs at every check-live pass, and after
+                      # `charly update` the container is rebuilt while the named
+                      # input volume survives. The bed must measure its OWN
+                      # perform, never a leftover one.
+                      rm -f /crabbox/authorized_keys /crabbox/lease.env /crabbox/bootstrap.sh
+                      # The contract user's home is the passwd entry's field, never a
+                      # hardcoded /home/crabbox: this base adopts uid 1000 from the
+                      # distro image (measured: crabbox's home is /home/user), so a
+                      # hardcoded path would make the absence probe vacuous.
+                      home=$(getent passwd crabbox | cut -d: -f6)
+                      test -n "$home"
+                      rm -rf "$home/.ssh"
+                      rm -f /var/lib/crabbox/bootstrapped /var/lib/crabbox/lease.env /var/lib/crabbox/bootstrap-marker
+                      rm -f /tmp/crabbox-lease-key /tmp/crabbox-lease-key.pub /tmp/crabbox-code-server.log /tmp/crabbox-code-start.out /tmp/code-root.html /tmp/code-root.headers
+                      # ABSENCE of the editor: nothing may listen on the
+                      # starter's loopback port, and an HTTP probe must NOT get
+                      # an answer. A probe that cannot fail is not an assertion.
+                      if ss -ltn 'sport = :8080' | grep -q LISTEN; then
+                        echo "FAIL: something is still listening on 8080 before the start" >&2
+                        exit 1
+                      fi
+                      if out=$(curl -fsS --max-time 3 http://127.0.0.1:8080/healthz 2>&1); then
+                        printf '%s\n' "$out" >&2
+                        echo "FAIL: code-server answered before the start" >&2
+                        exit 1
+                      fi
+                      # ABSENCE of the lease contract: no authorized_keys are
+                      # applied and the fresh key is refused by AUTHENTICATION.
+                      # A venue that does not answer fails this step instead of
+                      # reading as "not applied yet".
+                      ssh-keygen -q -t ed25519 -N '' -f /tmp/crabbox-lease-key
+                      out=$(ssh -p 2222 -i /tmp/crabbox-lease-key \
+                        -o BatchMode=yes -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+                        crabbox@127.0.0.1 true 2>&1 || true)
+                      case "$out" in
+                        *"Permission denied (publickey"*) ;;
+                        *)
+                          printf '%s\n' "$out" >&2
+                          echo "FAIL: expected the lease to refuse the key over SSH; a venue that does not answer cannot prove the absence" >&2
+                          exit 1
+                          ;;
+                      esac
+                      test ! -e "$home/.ssh/authorized_keys"
+                      echo "ABSENT: code-server is installed but not serving on 8080; the lease refuses the key"
+                  in_container: true
+            - check: perform — the shared bootstrap consumes the lease inputs and crabbox starts the editor over SSH on 2222
+              id: code-server-performs-the-start
+              context:
+                - runtime
+              timeout: 240s
+              command:
+                  command: |
+                      set -euo pipefail
+                      install -d -m 0755 /crabbox
+                      # The consumer writes each input TEMP + mv; the bootstrap
+                      # reads each one ONCE. Write the same way, so the bed
+                      # exercises the contract's own input path rather than an
+                      # in-place rewrite it forbids.
+                      install -m 0644 /tmp/crabbox-lease-key.pub /crabbox/.authorized_keys.tmp
+                      printf 'crabbox_bed_nonce=%s\n' charly-pod-crabbox-code-bed > /crabbox/.lease.env.tmp
+                      printf '#!/bin/bash\nset -euo pipefail\nprintf "%%s\\n" "$crabbox_bed_nonce" > /var/lib/crabbox/bootstrap-marker\n' > /crabbox/.bootstrap.sh.tmp
+                      chmod 0755 /crabbox/.bootstrap.sh.tmp
+                      mv /crabbox/.authorized_keys.tmp /crabbox/authorized_keys
+                      mv /crabbox/.lease.env.tmp /crabbox/lease.env
+                      mv /crabbox/.bootstrap.sh.tmp /crabbox/bootstrap.sh
+                      # Direct mode's own shared bootstrap applies the inputs.
+                      /usr/local/libexec/crabbox/bootstrap.sh
+                      test -f /var/lib/crabbox/bootstrapped
+                      test -f /var/lib/crabbox/lease.env
+                      marker=$(tr -d '\n' < /var/lib/crabbox/bootstrap-marker)
+                      test "$marker" = charly-pod-crabbox-code-bed
+                      # Start the editor through the LEASE'S OWN SSH path as
+                      # crabbox. setsid + nohup with every fd redirected detaches
+                      # it from the SSH channel; the presence step polls the
+                      # socket, not a sleep.
+                      ssh -p 2222 -i /tmp/crabbox-lease-key \
+                        -o BatchMode=yes -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+                        crabbox@127.0.0.1 \
+                        'setsid nohup /usr/local/bin/crabbox-start-code >/tmp/crabbox-code-server.log 2>&1 </dev/null & echo STARTED' \
+                        > /tmp/crabbox-code-start.out
+                      grep -qx STARTED /tmp/crabbox-code-start.out
+                      echo "PERFORMED: the lease bootstrap applied the inputs and crabbox started crabbox-start-code over SSH"
+                  in_container: true
+            - check: presence — the installed release ANSWERS over HTTP on loopback 8080, and the lease contract holds over SSH as crabbox
+              id: code-server-present-and-lease-holds
+              context:
+                - runtime
+              timeout: 240s
+              eventually: 120s
+              retry_interval: 2s
+              command:
+                  command: |
+                      set -euo pipefail
+                      # The lease contract's own SSH path, as the contract user:
+                      # the login name, passwordless sudo and the readiness hook
+                      # the consumer polls. These are terms only a usable lease
+                      # produces.
+                      out=$(ssh -p 2222 -i /tmp/crabbox-lease-key \
+                        -o BatchMode=yes -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+                        crabbox@127.0.0.1 \
+                        'id -un && sudo -n true && echo SUDO_OK && /usr/local/libexec/crabbox/ready && echo READY_OK')
+                      printf '%s\n' "$out"
+                      printf '%s\n' "$out" | grep -qx crabbox
+                      printf '%s\n' "$out" | grep -qx SUDO_OK
+                      printf '%s\n' "$out" | grep -qx READY_OK
+                      # The editor ANSWERS: an HTTP request to its health
+                      # endpoint gets code-server's own status JSON. A listener
+                      # alone is not an answer, which is why this is not a
+                      # `test -S`. `expired` is the correct no-client heartbeat
+                      # state, so the assertion is that the route ANSWERS — not
+                      # that a client heartbeat is fresh.
+                      if ! body=$(curl -fsS --max-time 5 http://127.0.0.1:8080/healthz); then
+                        echo "FAIL: code-server did not answer on its health endpoint" >&2
+                        echo "--- /tmp/crabbox-code-server.log ---" >&2
+                        tail -60 /tmp/crabbox-code-server.log >&2 || true
+                        exit 1
+                      fi
+                      printf 'healthz: %s\n' "$body"
+                      printf '%s\n' "$body" | grep -Eq '"status":"(alive|expired)"'
+                      # Its own web surface answers too, with the workbench HTML
+                      # document, so the proof is not a sidecar health route only.
+                      code=$(curl -sS --max-time 10 -D /tmp/code-root.headers -o /tmp/code-root.html -w '%{http_code}' http://127.0.0.1:8080/)
+                      test "$code" = 200
+                      test -s /tmp/code-root.html
+                      grep -qi '^content-type: text/html' /tmp/code-root.headers
+                      grep -qi 'code-server' /tmp/code-root.html
+                      # The listener is LOOPBACK ONLY: the image's stated
+                      # boundary. A wildcard bind fails here.
+                      listen=$(ss -ltnH 'sport = :8080')
+                      printf '%s\n' "$listen"
+                      printf '%s\n' "$listen" | grep -q '127\.0\.0\.1:8080'
+                      if printf '%s\n' "$listen" | grep -Eq '(0\.0\.0\.0|\*|\[::\]):8080'; then
+                        echo "FAIL: code-server is bound to a non-loopback address" >&2
+                        exit 1
+                      fi
+                      # The process RUNNING the installed release is the lease
+                      # user's, not a stale or foreign server. This ties the HTTP
+                      # answer above to the artifact under test. The scan walks
+                      # /proc because `ss -p` cannot map a rootless container's
+                      # socket (measured: `ss -ltnp` prints no pid, and
+                      # /proc/<pid>/fd is unreadable). The needle is split so the
+                      # scanning shell's own argv does not contain it.
+                      needle="/usr/local/lib/""code-server"
+                      found=0
+                      bound=0
+                      for p in /proc/[0-9]*; do
+                        pid=${p##*/}
+                        [ "$pid" = "$$" ] && continue
+                        cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+                        case "$cmd" in
+                          *"$needle"*)
+                            found=1
+                            printf 'code-server pid %s: %s\n' "$pid" "$cmd"
+                            uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9]\+\).*/\1/p' "/proc/$pid/status")
+                            test "$uid" = 1000
+                            case "$cmd" in
+                              *"--bind-addr 127.0.0.1:8080"*) bound=1 ;;
+                            esac
+                            ;;
+                        esac
+                      done
+                      test "$found" = 1
+                      test "$bound" = 1
+                      # The loopback listener belongs to uid 1000 (code-server
+                      # runs as crabbox); with the scan above, the server
+                      # answering is the installed release as the lease user.
+                      ss -ltnpe 'sport = :8080' | grep -q 'uid:1000'
+                      # The perform pass's own lease work was consumed by the
+                      # shared bootstrap this bed ran.
+                      test -f /var/lib/crabbox/bootstrapped
+                      marker=$(tr -d '\n' < /var/lib/crabbox/bootstrap-marker)
+                      test "$marker" = charly-pod-crabbox-code-bed
+                      echo "PRESENT: the installed code-server answers on loopback 8080 as crabbox, and the lease holds over SSH"
+                  in_container: true
